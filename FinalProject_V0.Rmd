@@ -1,0 +1,358 @@
+---
+title: "Final Project"
+date: "2025-03-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Data Preparing
+
+```{r}
+# Load required libraries
+library(quantmod)
+library(forecast)
+library(ggplot2)
+library(tidyverse)
+library(fracdiff)
+library(vars)
+library(Metrics)
+library(dplyr)
+library(lmtest)
+library(tseries)
+library(FinTS)
+library(rugarch)
+```
+
+```{r}
+cpi_data <- read.csv("CPIAUCNS.csv")
+cpi_data$DATE <- as.Date(cpi_data$observation_date)
+cpi_ts <- ts(cpi_data$CPIAUCNS, start = c(year(min(cpi_data$DATE)), month(min(cpi_data$DATE))), frequency = 12)
+
+# Download data
+getSymbols(c("DFF", "FEDFUNDS", "UNRATE", "GDP", "M2SL"), src = "FRED")
+
+# Convert to time series format, extracting data after 2000-01-01
+fedfunds_ts <- window(ts(FEDFUNDS, start = c(1954, 7), frequency = 12), start = c(1999, 12), end = c(2025, 1))  # Monthly
+unrate_ts <- window(ts(UNRATE, start = c(1948, 1), frequency = 12), start = c(1999, 12), end = c(2025, 1))  # Monthly
+# gdp_ts <- window(ts(GDP, start = c(1947, 1), frequency = 4), start = c(2000, 1))  # Quarterly
+m2_ts <- window(ts(M2SL, start = c(1959, 1), frequency = 12), start = c(1999, 12), end = c(2025, 1))  # Monthly
+
+# Merge all time series into a dataset
+dataset <- data.frame(
+  Date = seq(as.Date("2000-01-01"), by = "month", length.out = length(cpi_ts)),
+  CPI = as.numeric(cpi_ts),
+  FEDFUNDS = as.numeric(fedfunds_ts[-1]),
+  UNRATE = as.numeric(unrate_ts[-1]),
+  M2 = as.numeric(m2_ts[-1])
+)
+
+# Create lagged versions of external regressors (1-month lag)
+dataset_lag <- data.frame(
+  Date = seq(as.Date("2000-01-01"), by = "month", length.out = length(cpi_ts)),
+  CPI = as.numeric(cpi_ts),
+  FEDFUNDS = as.numeric(fedfunds_ts[-length(fedfunds_ts)]),
+  UNRATE = as.numeric(unrate_ts[-length(unrate_ts)]),
+  M2 = as.numeric(m2_ts[-length(m2_ts)])
+)
+```
+
+```{r}
+summary(dataset)
+```
+
+# 2. EDA
+
+## (1) Time Series Plots
+
+```{r}
+# Plot time series trends
+plot(cpi_ts, main = "Consumer Price Index (CPI)", 
+     ylab = "CPI", xlab = "Time", col = "darkred", lwd = 2)
+plot(fedfunds_ts, main = "Effective Federal Funds Rate", 
+     ylab = "EFFR", xlab = "Time", col = "darkred", lwd = 2)
+plot(unrate_ts, main = "Unemployment Rate", 
+     ylab = "Unemployment Rate", xlab = "Time", col = "darkred", lwd = 2)
+plot(m2_ts, main = "M2 Money Supply", 
+     ylab = "M2 Supply", xlab = "Time", col = "darkred", lwd = 2)
+```
+
+## (2) Boxplots
+
+```{r}
+# Boxplots for each feature
+par(mfrow = c(2,2), mar = c(2,3,2,2), cex.lab = 1.2, cex.axis = 1.2, cex.main = 1.2)  # Arrange plots in a 2x2 layout
+boxplot(dataset$CPI, main = "Boxplot of CPI", col = "darkred")
+boxplot(dataset$FEDFUNDS, main = "Boxplot of FEDFUNDS", col = "darkred")
+boxplot(dataset$UNRATE, main = "Boxplot of UNRATE", col = "darkred")
+boxplot(dataset$M2, main = "Boxplot of M2", col = "darkred")
+par(mfrow = c(1,1))  # Reset layout
+```
+
+## (3) Spectrum Analysis
+
+```{r}
+# spectrum analysis
+spectrum(cpi_ts)
+```
+
+## (4) Decomposition
+
+```{r}
+# Decompose the time series into trend, seasonal, and random components
+decomp <- decompose(cpi_ts, type = "multiplicative")
+
+# Plot the decomposition
+autoplot(decomp)+theme_minimal()
+```
+
+## (5) Check Stationarity
+
+```{r}
+library(tseries)
+# ADF Test for stationarity
+adf_test <- adf.test(cpi_ts)
+print(adf_test)
+# Plot ACF and PACF
+acf(cpi_ts, main = "ACF")
+pacf(cpi_ts, main = "PACF")
+```
+
+The data is non-stationary because P-value = 0.99 that significantly greater than 0.05.
+
+# 3. Models
+
+## (1) Univariate
+
+```{r}
+cpi_ts_train <- window(cpi_ts, start = c(2000, 1), end = c(2023, 12))
+cpi_ts_test <- window(cpi_ts, start = c(2024, 1))
+
+evaluate_performance <- function(actual, predicted) {
+  mse_value <- mse(actual, predicted)
+  rmse_value <- rmse(actual, predicted)
+  mae_value <- mae(actual, predicted)
+  rss <- sum((actual - predicted)^2)  # Residual Sum of Squares
+  tss <- sum((actual - mean(actual))^2)  # Total Sum of Squares
+  r_squared <- 1 - (rss/tss)
+  results <- list(
+    MSE = mse_value,
+    RMSE = rmse_value,
+    MAE = mae_value,
+    R_squared = r_squared
+  )
+  return(results)
+}
+```
+
+### a. Regression Model
+
+```{r}
+regression <- tslm(cpi_ts_train ~ trend + season)
+summary(regression)
+```
+
+```{r}
+checkresiduals(regression)
+```
+
+```{r}
+regression_forecast <- forecast(regression, h = 13)
+plot(regression_forecast)
+```
+
+```{r}
+evaluate_performance(cpi_ts_test, regression_forecast$mean)
+```
+
+### b. ARIMA Model
+
+```{r}
+lambda <- BoxCox.lambda(cpi_ts_train)
+print(lambda)
+```
+
+```{r}
+shapiro.test(cpi_ts_train)
+```
+
+```{r}
+arima <- auto.arima(cpi_ts_train, lambda = lambda)
+summary(arima)
+```
+
+```{r}
+checkresiduals(arima)
+```
+
+```{r}
+arima_forecast <- forecast(arima, h = 13)
+plot(arima_forecast)
+```
+
+```{r}
+evaluate_performance(cpi_ts_test, arima_forecast$mean)
+```
+
+### c. GARCH Model
+
+```{r}
+residuals_arima <- residuals(arima)
+# Perform ARCH-LM test (using 5 lags)
+arch_test <- ArchTest(residuals_arima, lags = 5)
+print(arch_test)
+```
+
+```{r}
+# Define GARCH(1,1) Model for CPI
+garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+                         mean.model = list(armaOrder = c(2,2), include.mean = TRUE),
+                         distribution.model = "norm")
+
+# Fit GARCH model to CPI
+garch_model <- ugarchfit(spec = garch_spec, data = cpi_ts_train)
+
+# View results
+summary(garch_model)
+```
+
+```{r}
+garch_forecast <- ugarchforecast(garch_model, n.ahead = 13)
+evaluate_performance(cpi_ts_test, garch_forecast@forecast$seriesFor)
+```
+
+## (2) Multivariate
+
+```{r}
+# Split data into training (2000-01 to 2023-12) and testing (2024-01 onward)
+
+train_end <- which(dataset$Date == as.Date("2023-12-01"))
+dataset_train <- dataset[1:train_end, ]
+dataset_test <- dataset[(train_end + 1):nrow(dataset), ]
+
+dataset_lag_train <- dataset_lag[1:train_end, ]
+dataset_lag_test <- dataset_lag[(train_end + 1):nrow(dataset), ]
+```
+
+```{r}
+cor(dataset_train$CPI, dataset_train$FEDFUNDS, use = "complete.obs")
+cor(dataset_train$CPI, dataset_train$UNRATE, use = "complete.obs")
+cor(dataset_train$CPI, dataset_train$M2, use = "complete.obs")
+```
+
+```{r}
+granger_test <- grangertest(CPI ~ FEDFUNDS, order = 2, data = dataset_train)
+print("FEDFUNDS:")
+print(granger_test)
+granger_test <- grangertest(CPI ~ UNRATE, order = 2, data = dataset_train)
+print("UNRATE:")
+print(granger_test)
+granger_test <- grangertest(CPI ~ M2, order = 2, data = dataset_train)
+print("M2:")
+print(granger_test)
+```
+
+### Reg-ARMA
+
+```{r}
+# Regression with ARMA Errors
+reg_arma <- auto.arima(cpi_ts_train, 
+                             xreg = as.matrix(dataset_train[, c("M2")]), 
+                             seasonal = TRUE)
+
+summary(reg_arma)
+```
+
+```{r}
+# Check residuals of the model
+checkresiduals(reg_arma)
+```
+
+```{r}
+# Make predictions
+arima_m2 <- auto.arima(dataset_train[, c("M2")], lambda = "auto")
+m2_forecast <- forecast(arima_m2, h = 13)
+```
+
+
+```{r}
+reg_arma_forecast <- forecast(reg_arma, 
+                              xreg = as.matrix(m2_forecast$mean), 
+                              h = nrow(dataset_lag_test))
+evaluate_performance(cpi_ts_test, reg_arma_forecast$mean)
+```
+
+```{r}
+autoplot(reg_arma_forecast)+theme_minimal()
+
+# Create a dataframe for plotting
+plot_data <- data.frame(
+  Date = dataset_test$Date,
+  Actual = cpi_ts_test,
+  Predicted = reg_arma_forecast$mean
+)
+
+# Plot forecast vs actual
+ggplot(plot_data, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = Predicted, color = "Forecast"), size = 1, linetype = "dashed") +
+  labs(title = "Regression with ARMA Residuals Forecast vs Actual CPI", x = "Date", y = "CPI") +
+  scale_color_manual(name = "Legend", values = c("Actual" = "blue", "Forecast" = "red")) +
+  theme_minimal()
+```
+
+### VAR
+
+```{r}
+# Check stationarity of each variable
+adf.test(diff(log(dataset_train$CPI)))
+adf.test(diff(log(dataset_train$M2)))
+```
+
+```{r}
+# Log transformation and differencing
+dataset_train$CPI_log_diff <- c(NA, diff(log(dataset_train$CPI)))
+dataset_test$CPI_log_diff <- c(NA, diff(log(dataset_test$CPI)))
+
+# Log transformation and differencing on M2
+dataset_train$M2_log_diff <- c(NA, diff(log(dataset_train$M2)))
+dataset_test$M2_log_diff <- c(NA, diff(log(dataset_test$M2)))
+```
+
+```{r}
+var_train <- cbind(
+  dataset_train$CPI_log_diff,
+  dataset_train$M2_log_diff
+)
+
+var_train <- na.omit(var_train)
+colnames(var_train) <- c("CPI_log_diff", "M2_log_diff")
+
+var_model <- VAR(var_train, p = 10, type = "both", season = 12)
+var_forecast <- predict(var_model, n.ahead = nrow(dataset_test))
+
+# Extract CPI forecasts and convert back from log differences
+cpi_forecast_log_diff <- var_forecast$fcst$CPI_log_diff[,1]  # Forecasted log differences
+cpi_forecast <- exp(log(tail(dataset_train$CPI, 1)) + cumsum(cpi_forecast_log_diff)) 
+print(evaluate_performance(dataset_test$CPI, cpi_forecast))
+```
+
+```{r}
+# Create dataframe for plotting
+plot_data <- data.frame(
+  Date = time(cpi_ts_test),
+  Actual = dataset_test$CPI,
+  Forecast = cpi_forecast
+)
+
+# Plot actual vs forecasted CPI
+ggplot(plot_data, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = Forecast, color = "Forecast"), size = 1, linetype = "dashed") +
+  labs(title = "VAR Model Forecast vs Actual CPI", x = "Time", y = "CPI") +
+  scale_color_manual(name = "Legend", values = c("Actual" = "blue", "Forecast" = "red")) +
+  theme_minimal()
+
+```
